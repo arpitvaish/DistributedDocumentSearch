@@ -1,0 +1,5 @@
+app:
+  rate-limit:
+    # Effectively unlimited during tests so multi-step flows don't hit 429.
+    # Production rate is set in src/main/resources/application.yml.
+    requests-per-second: 1000000.0

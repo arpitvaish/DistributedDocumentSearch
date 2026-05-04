@@ -1,0 +1,22 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: distributed-document-search
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+app:
+  rate-limit:
+    requests-per-second: 100.0
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+    tags-sorter: alpha
+    display-request-duration: true
+  api-docs:
+    path: /v3/api-docs
