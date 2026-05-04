@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "claude": {
+      "command": "npx",
+      "args": ["-y", "@anthropic-ai/claude-mcp-server"],
+      "env": {
+        "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}"
+      }
+    },
+    "gemini": {
+      "command": "npx",
+      "args": ["-y", "@google/generative-ai-mcp-server"],
+      "env": {
+        "GOOGLE_API_KEY": "${GOOGLE_API_KEY}",
+        "GOOGLE_CLOUD_PROJECT": "real-mindfulengineer"
+      }
+    },
+    "github": {
+      "command": "uvx",
+      "args": ["mcp-server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+      }
+    }
+  }
+}
