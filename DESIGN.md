@@ -47,6 +47,7 @@ This document describes the architecture and design decisions for a prototype im
 | F4 | Delete a document (DELETE /documents/{id}) |
 | F5 | Health check with dependency status (GET /health) |
 | F6 | Tenant isolation — a tenant can only access their own documents |
+| F7 | Upload and index files (POST /documents/upload) — PDF, DOCX, XLSX, PPTX, TXT, HTML, RTF, ODT |
 
 ### Non-Functional
 | # | Requirement | Target |
@@ -168,7 +169,32 @@ tryAcquire() → true if tokens_available ≥ 1, else false
 
 ---
 
-### 3.6 Lombok
+### 3.6 Apache Tika 2.9
+
+**Why Tika?**
+- Industry-standard text extraction library used by Apache Solr and Elasticsearch
+- Single API (`Tika.parseToString`) handles 20+ file formats: PDF, DOCX, XLSX, PPTX, HTML, RTF, ODT, plain text
+- `AutoDetectParser` detects the MIME type from file bytes + filename extension and routes to the correct sub-parser automatically
+- Passes filename metadata so format-ambiguous files (e.g. XML-based Office formats) are parsed correctly
+
+**Key usage pattern:**
+```java
+String mimeType = tika.detect(bytes, filename);   // MIME check with filename hint
+Metadata meta = new Metadata();
+meta.set(TikaCoreProperties.RESOURCE_NAME_KEY, filename);
+String text = tika.parseToString(new ByteArrayInputStream(bytes), meta);  // parse once
+```
+
+**Important dependency note:** `tika-parsers-standard-package` declares `tika-core` as `provided` scope, so `tika-core` must be listed as an explicit `compile`-scope dependency alongside it.
+
+**Alternatives considered:**
+- *Apache PDFBox (PDF only)* — single format; Tika gives us multi-format from one dependency
+- *iText* — license restrictions; commercial use requires a paid licence
+- *Manual per-format parsers* — significant maintenance overhead
+
+---
+
+### 3.7 Lombok
 
 Reduces boilerplate for model classes. `@Data`, `@Builder`, `@NoArgsConstructor`, `@AllArgsConstructor` generate getters, setters, builders, and constructors at compile time with no runtime cost.
 
@@ -203,6 +229,7 @@ Reduces boilerplate for model classes. `@Data`, `@Builder`, `@NoArgsConstructor`
 │  │                                                            │     │
 │  │  DocumentController    SearchController    HealthController│     │
 │  │  POST /documents       GET /search         GET /health     │     │
+│  │  POST /documents/upload (multipart)                        │     │
 │  │  GET  /documents/{id}                                      │     │
 │  │  DEL  /documents/{id}                                      │     │
 │  └────────────────────────────────────────────────────────────┘     │
@@ -215,6 +242,10 @@ Reduces boilerplate for model classes. `@Data`, `@Builder`, `@NoArgsConstructor`
 │  │  • Orchestrates search, cache, rate limit, storage         │     │
 │  │  • Tenant-scoped in-memory document store                  │     │
 │  │    (ConcurrentHashMap<tenantId, Map<docId, Document>>)     │     │
+│  │                                                            │     │
+│  │              DocumentParserService (Apache Tika)           │     │
+│  │  • MIME type detection + text extraction from uploads      │     │
+│  │  • Supports: TXT, HTML, RTF, PDF, DOCX, XLSX, PPTX, ODT  │     │
 │  └────────────────────────────────────────────────────────────┘     │
 │           │                    │                    │               │
 │           ▼                    ▼                    ▼               │
@@ -279,7 +310,22 @@ Provides O(1) document retrieval by ID without Lucene round-trips. Stores full d
 
 Maintains `ConcurrentHashMap<tenantId, RateLimiter>`. Lazily creates a `RateLimiter` for each new tenant on first access. Uses `tryAcquire()` (zero-timeout) for instant rejection — never blocks the calling thread.
 
-### 5.5 GlobalExceptionHandler (`@RestControllerAdvice`)
+### 5.5 DocumentParserService
+
+Wraps Apache Tika to extract plain text from uploaded files. Called by `DocumentController` before `DocumentService.indexDocument()`.
+
+**Processing steps:**
+1. Read all bytes from the `MultipartFile` (validates the file is non-empty)
+2. Detect MIME type via `Tika.detect(bytes, filename)` — uses both magic bytes and file extension
+3. Reject unsupported MIME types with `UnsupportedFileTypeException` → 415
+4. Extract text via `Tika.parseToString(ByteArrayInputStream, Metadata)` — `Metadata` carries the filename so format-ambiguous files (e.g. OOXML) are parsed correctly
+5. Return a `ParsedDocument` record: `text`, `mimeType`, `originalFilename`, `titleFromFilename`
+
+**Title derivation from filename:** strips extension, replaces `_` and `-` with spaces, lowercases. Falls back to `"Untitled"` if no filename is provided.
+
+**Supported formats:** TXT, HTML, RTF, PDF, DOCX, XLSX, PPTX, ODT (via `tika-parsers-standard-package`)
+
+### 5.6 GlobalExceptionHandler (`@RestControllerAdvice`)
 
 Centralised error handling. Maps exception types to HTTP status codes:
 
@@ -287,6 +333,8 @@ Centralised error handling. Maps exception types to HTTP status codes:
 |---|---|
 | `DocumentNotFoundException` | 404 Not Found |
 | `RateLimitExceededException` | 429 Too Many Requests + `Retry-After: 1` |
+| `UnsupportedFileTypeException` | 415 Unsupported Media Type |
+| `MaxUploadSizeExceededException` | 413 Payload Too Large |
 | `MethodArgumentNotValidException` | 400 Bad Request |
 | `ParseException` (Lucene) | 400 Bad Request |
 | `IllegalArgumentException` | 400 Bad Request |
@@ -368,7 +416,8 @@ X-Tenant-ID: <tenant-identifier>
 
 | Method | Path | Description | Auth Required |
 |---|---|---|---|
-| `POST` | `/documents` | Index a new document | Yes |
+| `POST` | `/documents` | Index a new document (JSON body) | Yes |
+| `POST` | `/documents/upload` | Upload a file and index extracted text | Yes |
 | `GET` | `/documents/{id}` | Retrieve document by ID | Yes |
 | `DELETE` | `/documents/{id}` | Delete a document | Yes |
 | `GET` | `/search` | Full-text search | Yes |
@@ -581,6 +630,45 @@ sequenceDiagram
     DS-->>GE: exception propagates
     GE->>GE: @ExceptionHandler(RateLimitExceededException)
     GE-->>C: 429 Too Many Requests<br/>Retry-After: 1<br/>{status:429, message:"Rate limit exceeded..."}
+```
+
+---
+
+### 8.6 File Upload (POST /documents/upload)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C  as Client
+    participant TI as TenantInterceptor
+    participant DC as DocumentController
+    participant DP as DocumentParserService
+    participant DS as DocumentService
+    participant LS as LuceneSearchService
+    participant CA as CaffeineCache
+
+    C->>TI: POST /documents/upload<br/>Content-Type: multipart/form-data<br/>Header: X-Tenant-ID: tenant-a<br/>Body: file=kafka_overview.txt [, title=optional]
+    TI->>TI: Validate & set TenantContext
+    TI->>DC: Forward request
+
+    DC->>DP: parse(multipartFile)
+    DP->>DP: Read all bytes (validate non-empty)
+    DP->>DP: Tika.detect(bytes, filename) → MIME type
+    alt Unsupported MIME type (e.g. application/zip)
+        DP-->>DC: UnsupportedFileTypeException
+        DC-->>C: 415 Unsupported Media Type
+    end
+    DP->>DP: Tika.parseToString(bytes, metadata) → plain text
+    DP-->>DC: ParsedDocument{text, mimeType, titleFromFilename}
+
+    DC->>DC: title = request param "title" if provided,<br/>else ParsedDocument.titleFromFilename()
+    DC->>DC: Build DocumentRequest{title, content=text}
+    DC->>DS: indexDocument(tenantId, request)
+    DS->>LS: indexDocument(doc)
+    LS->>LS: writer.addDocument + commit + refreshReader
+    DS->>CA: cache.clear()
+    DS-->>DC: Document
+    DC-->>C: 201 Created {id, title, tenantId, ...}
 ```
 
 ---

@@ -8,6 +8,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
+import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.util.UUID;
@@ -202,5 +203,103 @@ class DocumentControllerTest {
         // Original document is still accessible by tenantA
         mockMvc.perform(get("/documents/" + id).header(TENANT_HEADER, tenantA))
                 .andExpect(status().isOk());
+    }
+
+    // --- POST /documents/upload ---
+
+    @Test
+    void POST_upload_plainText_returns201WithIndexedDocument() throws Exception {
+        MockMultipartFile file = new MockMultipartFile(
+                "file", "report.txt", "text/plain", "quarterly earnings financial report".getBytes());
+
+        mockMvc.perform(multipart("/documents/upload")
+                        .file(file)
+                        .header(TENANT_HEADER, uniqueTenant()))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.id").isNotEmpty())
+                .andExpect(jsonPath("$.title").value("report"))
+                .andExpect(jsonPath("$.tenantId").isNotEmpty());
+    }
+
+    @Test
+    void POST_upload_withTitleOverride_usesTitleParam() throws Exception {
+        MockMultipartFile file = new MockMultipartFile(
+                "file", "raw_data.txt", "text/plain", "some important content".getBytes());
+
+        mockMvc.perform(multipart("/documents/upload")
+                        .file(file)
+                        .param("title", "Custom Title Override")
+                        .header(TENANT_HEADER, uniqueTenant()))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.title").value("Custom Title Override"));
+    }
+
+    @Test
+    void POST_upload_htmlFile_stripsTagsAndIndexes() throws Exception {
+        String html = "<html><body><h1>Spring Framework</h1><p>dependency injection container</p></body></html>";
+        MockMultipartFile file = new MockMultipartFile(
+                "file", "spring.html", "text/html", html.getBytes());
+
+        String tenant = uniqueTenant();
+        mockMvc.perform(multipart("/documents/upload")
+                        .file(file)
+                        .header(TENANT_HEADER, tenant))
+                .andExpect(status().isCreated());
+
+        // Verify the extracted text is searchable
+        mockMvc.perform(get("/search").header(TENANT_HEADER, tenant).param("q", "dependency injection"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.total").value(1));
+    }
+
+    @Test
+    void POST_upload_emptyFile_returns400() throws Exception {
+        MockMultipartFile file = new MockMultipartFile(
+                "file", "empty.txt", "text/plain", new byte[0]);
+
+        mockMvc.perform(multipart("/documents/upload")
+                        .file(file)
+                        .header(TENANT_HEADER, uniqueTenant()))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void POST_upload_unsupportedFileType_returns415() throws Exception {
+        MockMultipartFile file = new MockMultipartFile(
+                "file", "archive.zip", "application/zip",
+                new byte[]{0x50, 0x4B, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
+
+        mockMvc.perform(multipart("/documents/upload")
+                        .file(file)
+                        .header(TENANT_HEADER, uniqueTenant()))
+                .andExpect(status().isUnsupportedMediaType())
+                .andExpect(jsonPath("$.status").value(415));
+    }
+
+    @Test
+    void POST_upload_returns400WhenTenantHeaderMissing() throws Exception {
+        MockMultipartFile file = new MockMultipartFile(
+                "file", "doc.txt", "text/plain", "some content".getBytes());
+
+        mockMvc.perform(multipart("/documents/upload").file(file))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void POST_upload_uploadedDocumentIsSearchable() throws Exception {
+        String tenant = uniqueTenant();
+        MockMultipartFile file = new MockMultipartFile(
+                "file", "kubernetes_guide.txt", "text/plain",
+                "kubernetes container orchestration microservices deployment".getBytes());
+
+        mockMvc.perform(multipart("/documents/upload")
+                        .file(file)
+                        .header(TENANT_HEADER, tenant))
+                .andExpect(status().isCreated());
+
+        mockMvc.perform(get("/search").header(TENANT_HEADER, tenant).param("q", "kubernetes"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.total").value(1))
+                .andExpect(jsonPath("$.hits[0].title").value("kubernetes guide"));
     }
 }

@@ -87,7 +87,7 @@ DistributedDocumentSearch/
 │   │   └── resources/
 │   │       └── application.yml                  ← Main config
 │   └── test/
-│       ├── java/org/example/                    ← 98 tests across all layers
+│       ├── java/org/example/                    ← 122 tests across all layers
 │       └── resources/
 │           └── application.yml                  ← Test overrides (high rate limit)
 ├── Dockerfile                                   ← Multi-stage Docker build
@@ -167,10 +167,10 @@ Expected:
 mvn test
 ```
 
-Expected result: **98 tests, 0 failures**
+Expected result: **122 tests, 0 failures**
 
 ```
-Tests run: 98, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 122, Failures: 0, Errors: 0, Skipped: 0
 BUILD SUCCESS
 ```
 
@@ -182,14 +182,16 @@ mvn test -Dtest=LuceneSearchServiceTest
 mvn test -Dtest=DocumentServiceTest
 mvn test -Dtest=RateLimiterServiceTest
 mvn test -Dtest=TenantInterceptorTest
+mvn test -Dtest=DocumentParserServiceTest
 
 # Controller tests
 mvn test -Dtest=DocumentControllerTest
 mvn test -Dtest=SearchControllerTest
 mvn test -Dtest=HealthControllerTest
 
-# Integration test
+# Integration tests
 mvn test -Dtest=DocumentSearchIntegrationTest
+mvn test -Dtest=FileUploadSearchIntegrationTest
 ```
 
 ### Run tests with verbose output
@@ -206,10 +208,12 @@ mvn test -Dsurefire.useFile=false
 | `DocumentServiceTest` | 24 | CRUD orchestration, UUID generation, cache read/write, rate limiting, validation |
 | `RateLimiterServiceTest` | 7 | Token bucket, per-tenant isolation, rate enforcement, stats |
 | `TenantInterceptorTest` | 9 | Header validation, ThreadLocal lifecycle, blank/missing header rejection |
-| `DocumentControllerTest` | 14 | HTTP status codes, request validation, tenant isolation at API level |
+| `DocumentParserServiceTest` | 8 | Text/HTML/RTF extraction, MIME detection, empty file, unsupported type, title derivation |
+| `DocumentControllerTest` | 21 | HTTP status codes, request validation, tenant isolation, upload endpoint |
 | `SearchControllerTest` | 12 | Query syntax, pagination, tenant scoping, edge cases |
 | `HealthControllerTest` | 6 | Status reporting, no-auth access, live document counts |
 | `DocumentSearchIntegrationTest` | 7 | Full CRUD flow, multi-tenant isolation, caching, relevance scoring |
+| `FileUploadSearchIntegrationTest` | 9 | File upload + search end-to-end, HTML tag stripping, title override, ranking, tenant isolation, error cases |
 
 ---
 
@@ -392,7 +396,50 @@ No `X-Tenant-ID` header required.
 
 ---
 
-### 7.6 Multi-Tenant Demo
+### 7.6 Upload a File
+
+Upload a file and have its text extracted and indexed automatically. Supports TXT, HTML, RTF, PDF, DOCX, XLSX, PPTX, ODT.
+
+```bash
+# Upload a plain text file (title derived from filename: "kafka overview")
+curl -X POST http://localhost:8080/documents/upload \
+  -H "X-Tenant-ID: tenant-a" \
+  -F "file=@kafka_overview.txt"
+
+# Upload with a custom title
+curl -X POST http://localhost:8080/documents/upload \
+  -H "X-Tenant-ID: tenant-a" \
+  -F "file=@report_q4.txt" \
+  -F "title=Q4 2024 Financial Summary"
+
+# Upload an HTML file (tags are stripped; only visible text is indexed)
+curl -X POST http://localhost:8080/documents/upload \
+  -H "X-Tenant-ID: tenant-a" \
+  -F "file=@guide.html"
+```
+
+Response `201 Created`:
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "tenantId": "tenant-a",
+  "title": "kafka overview",
+  "content": "Apache Kafka is a distributed event streaming platform...",
+  "createdAt": "2026-05-04T10:30:00",
+  "updatedAt": "2026-05-04T10:30:00"
+}
+```
+
+After uploading, search the document content immediately:
+
+```bash
+curl "http://localhost:8080/search?q=streaming+analytics" \
+  -H "X-Tenant-ID: tenant-a"
+```
+
+---
+
+### 7.7 Multi-Tenant Demo
 
 Index the same content as two different tenants — they cannot see each other's data:
 
@@ -418,6 +465,8 @@ All settings are in `src/main/resources/application.yml`.
 |---|---|---|
 | `server.port` | `8080` | HTTP listen port |
 | `app.rate-limit.requests-per-second` | `100.0` | Max requests per second per tenant |
+| `spring.servlet.multipart.max-file-size` | `10MB` | Maximum size of a single uploaded file |
+| `spring.servlet.multipart.max-request-size` | `12MB` | Maximum total size of a multipart request |
 | `springdoc.swagger-ui.path` | `/swagger-ui.html` | Swagger UI redirect path |
 | `springdoc.api-docs.path` | `/v3/api-docs` | OpenAPI JSON endpoint |
 
@@ -595,6 +644,45 @@ Common causes:
 - Port 8080 conflict inside the container
 - JVM OOM (increase Docker memory limit to 512m+)
 - Missing `wget` in base image (the `eclipse-temurin:17-jre-alpine` image includes it)
+
+---
+
+### 415 Unsupported Media Type — "Unsupported file type: application/zip"
+
+The uploaded file's MIME type is not supported by the parser. Accepted formats: TXT, HTML, RTF, PDF, DOCX, XLSX, PPTX, ODT.
+
+```bash
+# This will fail
+curl -X POST http://localhost:8080/documents/upload \
+  -H "X-Tenant-ID: tenant-a" \
+  -F "file=@archive.zip"
+
+# Convert to a supported format first, or extract the text manually and POST to /documents
+```
+
+---
+
+### 413 Payload Too Large — "Maximum upload size exceeded"
+
+The uploaded file exceeds the configured limit (default: 10 MB per file, 12 MB total request).
+
+To increase the limit, add to `application.yml`:
+
+```yaml
+spring:
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 55MB
+```
+
+Or pass as a JVM argument:
+
+```bash
+java -jar target/DistributedDocumentSearch-1.0-SNAPSHOT.jar \
+  --spring.servlet.multipart.max-file-size=50MB \
+  --spring.servlet.multipart.max-request-size=55MB
+```
 
 ---
 
